@@ -289,15 +289,21 @@
 
     <script>
         let peer;
-        let conn; // Соединение для данных (чат)
+        let conn;
         let myStream;
         let currentUser = '';
         let isHost = false;
-        let connections = []; // Список подключенных юзеров (для хоста)
+        let connections = [];
         
         const videoElement = document.getElementById('main-video');
         const fileInput = document.getElementById('file-input');
         
+        // --- ГЕНЕРАТОР СЛУЧАЙНОГО ID ---
+        // Это решает проблему с CORS, так как мы не просим сервер придумать нам ID
+        function generateId() {
+            return 'eagle-' + Math.random().toString(36).substr(2, 9);
+        }
+
         // --- ЛОГИКА ИНТЕРФЕЙСА ---
 
         function showJoinInput() {
@@ -326,52 +332,91 @@
         function copyRoomId() {
             const text = document.getElementById('room-id-display').innerText.replace('ID: ', '');
             navigator.clipboard.writeText(text);
-            alert('ID скопирован в буфер обмена!');
+            alert('ID скопирован!');
         }
 
         // --- ЛОГИКА PeerJS (СЕТЬ) ---
 
-        function initPeer() {
+        function initPeer(customId = null) {
             currentUser = document.getElementById('nickname').value || 'Аноним';
-            // Используем публичный cloud server PeerJS
-            peer = new Peer(null, {
-                debug: 2
+            
+            // Если ID не передан (мы создаем комнату), генерируем его сами
+            // Если мы присоединяемся, ID нам не нужен (он создастся автоматом, но лучше задать)
+            const myId = customId || generateId();
+
+            // ВАЖНО: Мы задаем ID вручную первым параметром, чтобы пропустить шаг fetch('/id'),
+            // который вызывает ошибку CORS.
+            peer = new Peer(myId, {
+                debug: 2,
+                secure: true, // Обязательно для https (GitHub Pages)
+                config: {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:global.stun.twilio.com:3478' }
+                    ]
+                }
             });
 
             peer.on('open', (id) => {
+                console.log('My ID is: ' + id);
                 document.getElementById('room-id-display').innerText = 'ID: ' + id;
-                switchScreen();
+                
+                // Если мы создаем комнату - переключаем экран сразу
+                // Если присоединяемся - экран переключится, когда установится соединение
                 if (isHost) {
-                    log(`Комната создана. Отправь ID друзьям.`);
+                    switchScreen();
+                    log(`Комната создана. Ждем участников...`);
                     document.getElementById('upload-label').style.display = 'block';
                 }
             });
 
-            // Обработка входящих соединений
+            peer.on('error', (err) => {
+                console.error(err);
+                if (err.type === 'peer-unavailable') {
+                    alert('Комната с таким ID не найдена или создатель вышел.');
+                } else if (err.type === 'unavailable-id') {
+                    alert('Ошибка ID. Попробуйте обновить страницу.');
+                } else {
+                    alert('Ошибка соединения: ' + err.type);
+                }
+            });
+
+            // Входящие соединения (чат)
             peer.on('connection', (c) => {
-                // Если мы хост, сохраняем соединение
+                // Хост принимает всех
                 if (isHost) {
                     connections.push(c);
                     setupConnection(c);
-                    // Если видео уже идет, звоним новому участнику
+                    // Если стрим уже идет, сразу звоним новому участнику
                     if (myStream) {
-                        const call = peer.call(c.peer, myStream);
+                        setTimeout(() => {
+                            try {
+                                peer.call(c.peer, myStream);
+                                console.log('Calling new peer with stream');
+                            } catch(e) { console.error(e); }
+                        }, 1000);
                     }
                 } else {
+                    // Гость принимает соединение от хоста
                     setupConnection(c);
                 }
             });
 
-            // Обработка входящих звонков (видеопоток)
+            // Входящие звонки (видео)
             peer.on('call', (call) => {
-                call.answer(null); // Отвечаем без своего потока
+                console.log('Receiving call...');
+                call.answer(null); // Отвечаем
                 call.on('stream', (remoteStream) => {
+                    console.log('Stream received');
                     videoElement.srcObject = remoteStream;
-                    videoElement.play().catch(e => console.log('Autoplay blocked', e));
+                    videoElement.play().catch(e => {
+                        console.log('Autoplay blocked', e);
+                        // Показываем кнопку "Play" если автоплей заблокирован
+                        alert('Нажми на видео, чтобы запустить звук/картинку (политика браузера)');
+                    });
                     
-                    // Убираем контролы у гостей, так как управляет хост
                     if (!isHost) {
-                        videoElement.controls = false;
+                        videoElement.controls = false; 
                         log("Трансляция началась.");
                     }
                 });
@@ -382,53 +427,57 @@
             conn = c;
             
             c.on('open', () => {
-                c.send({ type: 'system', text: `${currentUser} присоединился!` });
+                console.log('Connection opened');
+                // Если мы гость и соединение открылось - переходим в комнату
+                if (!isHost) {
+                    switchScreen();
+                    c.send({ type: 'system', text: `${currentUser} вошел в чат!` });
+                }
             });
 
             c.on('data', (data) => {
                 if (data.type === 'chat') {
                     log({ author: data.author, text: data.text }, 'user');
-                    // Если мы хост, рассылаем сообщение всем остальным
-                    if (isHost) {
-                        broadcastData(data, c.peer); 
-                    }
+                    if (isHost) broadcastData(data, c.peer); 
                 } else if (data.type === 'system') {
                     log(data.text);
                 }
             });
             
-            c.on('close', () => log('Участник отключился'));
+            c.on('close', () => {
+                log('Связь потеряна');
+                connections = connections.filter(con => con.peer !== c.peer);
+            });
         }
 
         // --- ФУНКЦИИ ХОСТА ---
 
         function createRoom() {
             isHost = true;
-            initPeer();
+            initPeer(); // ID сгенерируется внутри
             
-            // Обработка загрузки файла
             fileInput.addEventListener('change', function(e) {
                 const file = e.target.files[0];
                 if (file) {
                     const url = URL.createObjectURL(file);
                     videoElement.src = url;
                     
-                    // Ждем загрузки метаданных, чтобы начать стрим
                     videoElement.onloadedmetadata = () => {
-                        // Магия: захватываем поток из видео элемента
-                        // В Firefox работает отлично, в Chrome требует .play()
                         try {
-                            const stream = videoElement.captureStream(); // Firefox / Chrome
+                            // captureStream работает в Chrome/Firefox
+                            // В Safari может потребоваться play() перед захватом
+                            const stream = videoElement.captureStream ? videoElement.captureStream() : videoElement.mozCaptureStream();
                             myStream = stream;
                             
-                            // Звоним всем подключенным
+                            // Звоним всем, кто уже подключен
                             connections.forEach(conn => {
+                                console.log('Calling ' + conn.peer);
                                 peer.call(conn.peer, stream);
                             });
                             
-                            log("Видео загружено. Трансляция запускается...");
+                            log("Видео загружено. Старт трансляции...");
                         } catch (err) {
-                            alert("Ваш браузер может не поддерживать захват потока из файла. Попробуйте Chrome или Firefox.");
+                            alert("Ваш браузер не поддерживает захват видео из файла. Пожалуйста, используйте Chrome или Firefox (Desktop).");
                             console.error(err);
                         }
                     };
@@ -439,17 +488,24 @@
         // --- ФУНКЦИИ ГОСТЯ ---
 
         function joinRoom() {
-            const destId = document.getElementById('room-id-input').value;
+            const destId = document.getElementById('room-id-input').value.trim();
             if (!destId) return alert("Введите ID");
             
             isHost = false;
+            // Генерируем свой ID сами, чтобы избежать CORS
             initPeer();
             
-            // Ждем инициализации своего PeerID перед подключением
+            // Ждем пока наш Peer откроется, потом коннектимся
             peer.on('open', () => {
+                console.log('Connecting to ' + destId);
                 conn = peer.connect(destId);
+                
+                conn.on('error', (err) => {
+                    console.error('Connection error:', err);
+                    alert('Не удалось подключиться к хосту. Проверьте ID.');
+                });
+
                 setupConnection(conn);
-                log("Подключение к комнате...");
             });
         }
 
@@ -461,23 +517,20 @@
             if (!text) return;
 
             const msgData = { type: 'chat', author: currentUser, text: text };
-            
-            // Отображаем у себя
             log({ author: currentUser, text: text }, 'user');
             
             if (isHost) {
                 broadcastData(msgData);
-            } else if (conn) {
+            } else if (conn && conn.open) {
                 conn.send(msgData);
             }
-            
             input.value = '';
         }
 
         function broadcastData(data, excludePeerId = null) {
             if (!isHost) return;
             connections.forEach(c => {
-                if (c.peer !== excludePeerId) {
+                if (c.peer !== excludePeerId && c.open) {
                     c.send(data);
                 }
             });
