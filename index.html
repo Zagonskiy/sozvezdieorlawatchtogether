@@ -339,16 +339,16 @@
 
         function initPeer(customId = null) {
             currentUser = document.getElementById('nickname').value || 'Аноним';
-            
-            // Если ID не передан (мы создаем комнату), генерируем его сами
-            // Если мы присоединяемся, ID нам не нужен (он создастся автоматом, но лучше задать)
             const myId = customId || generateId();
 
-            // ВАЖНО: Мы задаем ID вручную первым параметром, чтобы пропустить шаг fetch('/id'),
-            // который вызывает ошибку CORS.
+            // ОБНОВЛЕННАЯ КОНФИГУРАЦИЯ
+            // Мы жестко задаем порт 443 и host, чтобы обойти блокировки
             peer = new Peer(myId, {
+                host: '0.peerjs.com',
+                port: 443,
+                path: '/',
+                secure: true, // Обязательно для GitHub Pages
                 debug: 2,
-                secure: true, // Обязательно для https (GitHub Pages)
                 config: {
                     iceServers: [
                         { urls: 'stun:stun.l.google.com:19302' },
@@ -358,11 +358,9 @@
             });
 
             peer.on('open', (id) => {
-                console.log('My ID is: ' + id);
+                console.log('Успешное подключение! ID:', id);
                 document.getElementById('room-id-display').innerText = 'ID: ' + id;
                 
-                // Если мы создаем комнату - переключаем экран сразу
-                // Если присоединяемся - экран переключится, когда установится соединение
                 if (isHost) {
                     switchScreen();
                     log(`Комната создана. Ждем участников...`);
@@ -371,58 +369,47 @@
             });
 
             peer.on('error', (err) => {
-                console.error(err);
-                if (err.type === 'peer-unavailable') {
-                    alert('Комната с таким ID не найдена или создатель вышел.');
-                } else if (err.type === 'unavailable-id') {
-                    alert('Ошибка ID. Попробуйте обновить страницу.');
+                console.error('PeerJS Error:', err);
+                // Специальная обработка для ошибки сети
+                if (err.type === 'network') {
+                    alert('Ошибка сети! Сервер не отвечает. 1) Отключите VPN/AdBlock. 2) Попробуйте раздать интернет с телефона.');
+                } else if (err.type === 'peer-unavailable') {
+                    alert('Комната с таким ID не найдена (возможно, хост вышел).');
                 } else {
-                    alert('Ошибка соединения: ' + err.type);
+                    alert('Ошибка: ' + err.type);
                 }
             });
 
-            // Входящие соединения (чат)
+            // Обработчики соединений и звонков остаются прежними
             peer.on('connection', (c) => {
-                // Хост принимает всех
                 if (isHost) {
                     connections.push(c);
                     setupConnection(c);
-                    // Если стрим уже идет, сразу звоним новому участнику
                     if (myStream) {
                         setTimeout(() => {
-                            try {
-                                peer.call(c.peer, myStream);
-                                console.log('Calling new peer with stream');
-                            } catch(e) { console.error(e); }
+                            try { peer.call(c.peer, myStream); } catch(e) {}
                         }, 1000);
                     }
                 } else {
-                    // Гость принимает соединение от хоста
                     setupConnection(c);
                 }
             });
 
-            // Входящие звонки (видео)
             peer.on('call', (call) => {
-                console.log('Receiving call...');
-                call.answer(null); // Отвечаем
+                call.answer(null);
                 call.on('stream', (remoteStream) => {
-                    console.log('Stream received');
                     videoElement.srcObject = remoteStream;
                     videoElement.play().catch(e => {
-                        console.log('Autoplay blocked', e);
-                        // Показываем кнопку "Play" если автоплей заблокирован
-                        alert('Нажми на видео, чтобы запустить звук/картинку (политика браузера)');
+                        console.log('Autoplay error', e);
+                        alert('Нажми на экран видео, чтобы запустить просмотр!');
                     });
-                    
                     if (!isHost) {
-                        videoElement.controls = false; 
+                        videoElement.controls = false;
                         log("Трансляция началась.");
                     }
                 });
             });
         }
-
         function setupConnection(c) {
             conn = c;
             
